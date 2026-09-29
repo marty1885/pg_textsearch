@@ -1456,8 +1456,32 @@ typedef struct CollectExplicitIndexContext
 {
 	BM25OidCache *oid_cache;
 	List		 *requirements; /* List of ExplicitIndexRequirement */
-	bool		  has_bm25_operator;
 } CollectExplicitIndexContext;
+
+/* Detect BM25 operators, including those in nested queries. */
+static bool
+has_bm25_operator_walker(Node *node, BM25OidCache *oids)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, OpExpr))
+	{
+		OpExpr *opexpr = (OpExpr *)node;
+
+		if (opexpr->opno == oids->text_tpquery_operator_oid ||
+			opexpr->opno == oids->textarray_tpquery_operator_oid ||
+			opexpr->opno == oids->text_text_operator_oid ||
+			opexpr->opno == oids->textarray_text_operator_oid)
+			return true;
+	}
+
+	if (IsA(node, Query))
+		return query_tree_walker(
+				(Query *)node, has_bm25_operator_walker, oids, 0);
+
+	return expression_tree_walker(node, has_bm25_operator_walker, oids);
+}
 
 /*
  * Walker to find explicit index requirements in query expressions.
@@ -1469,21 +1493,13 @@ collect_explicit_indexes_walker(
 	if (node == NULL)
 		return false;
 
-	/* SubLinks, CTEs, and range-table entries contain nested Queries. */
+	/* Nested requirements must not constrain another query's index paths. */
 	if (IsA(node, Query))
-		return query_tree_walker(
-				(Query *)node, collect_explicit_indexes_walker, context, 0);
+		return false;
 
 	if (IsA(node, OpExpr))
 	{
-		OpExpr		 *opexpr = (OpExpr *)node;
-		BM25OidCache *oids	 = context->oid_cache;
-
-		if (opexpr->opno == oids->text_tpquery_operator_oid ||
-			opexpr->opno == oids->textarray_tpquery_operator_oid ||
-			opexpr->opno == oids->text_text_operator_oid ||
-			opexpr->opno == oids->textarray_text_operator_oid)
-			context->has_bm25_operator = true;
+		OpExpr *opexpr = (OpExpr *)node;
 
 		if ((opexpr->opno == context->oid_cache->text_tpquery_operator_oid ||
 			 opexpr->opno ==
@@ -1567,18 +1583,15 @@ collect_explicit_indexes_walker(
  * expressions with explicit index names, which is rare.
  */
 static List *
-collect_explicit_index_requirements(
-		Query *parse, BM25OidCache *oid_cache, bool *has_bm25_operator)
+collect_explicit_index_requirements(Query *parse, BM25OidCache *oid_cache)
 {
 	CollectExplicitIndexContext context;
 
-	context.oid_cache		  = oid_cache;
-	context.requirements	  = NIL;
-	context.has_bm25_operator = false;
+	context.oid_cache	 = oid_cache;
+	context.requirements = NIL;
 
-	/* Walk the entire query tree */
+	/* Collect requirements at this query level only. */
 	query_tree_walker(parse, collect_explicit_indexes_walker, &context, 0);
-	*has_bm25_operator = context.has_bm25_operator;
 
 	return context.requirements;
 }
@@ -1959,8 +1972,12 @@ tp_planner_hook(
 	 * without explicit index names, this avoids any overhead in the
 	 * set_rel_pathlist_hook.
 	 */
-	explicit_indexes = collect_explicit_index_requirements(
-			parse, &oid_cache, &query_has_bm25_operators);
+	query_has_bm25_operators =
+			has_bm25_operator_walker((Node *)parse, &oid_cache);
+	explicit_indexes =
+			query_has_bm25_operators
+					? collect_explicit_index_requirements(parse, &oid_cache)
+					: NIL;
 
 	if (explicit_indexes != NIL)
 	{

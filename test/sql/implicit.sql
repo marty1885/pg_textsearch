@@ -130,21 +130,10 @@ DEALLOCATE explicit_search;
 
 -- The score rewrite must use the query being planned, not parse-hook state
 -- left over from PREPARE. The DO statement itself clears that old state.
-SET plan_cache_mode = force_generic_plan;
 PREPARE prepared_score(text) AS
 SELECT id FROM implicit_docs
 ORDER BY content <@> to_bm25query($1, 'implicit_docs_idx')
 LIMIT 10;
-DO $$
-DECLARE plan json;
-BEGIN
-    EXECUTE 'EXPLAIN (FORMAT JSON, COSTS OFF, VERBOSE) EXECUTE prepared_score(''hello'')'
-        INTO plan;
-    IF plan::text NOT LIKE '%bm25_get_current_score()%' THEN
-        RAISE EXCEPTION 'prepared BM25 scan did not reuse the index score: %', plan;
-    END IF;
-END $$;
-DEALLOCATE prepared_score;
 
 -- The planner-time BM25 check must descend into a FROM subquery. The outer
 -- SELECT has no BM25 operator of its own.
@@ -154,17 +143,78 @@ SELECT id FROM (
     ORDER BY content <@> to_bm25query($1, 'implicit_docs_idx')
     LIMIT 2
 ) AS ranked;
+
+-- An inlined CTE also has no BM25 operator at the outer query level.
+PREPARE prepared_cte_score(text) AS
+WITH ranked AS (
+    SELECT id FROM implicit_docs
+    ORDER BY content <@> to_bm25query($1, 'implicit_docs_idx')
+    LIMIT 2
+)
+SELECT id FROM ranked;
+
 DO $$
-DECLARE plan json;
+DECLARE
+    plan json;
+    mode text;
+    statement text;
 BEGIN
-    EXECUTE 'EXPLAIN (FORMAT JSON, COSTS OFF, VERBOSE) EXECUTE prepared_subquery_score(''hello'')'
-        INTO plan;
-    IF plan::text NOT LIKE '%bm25_get_current_score()%' THEN
-        RAISE EXCEPTION 'subquery BM25 scan did not reuse the index score: %', plan;
+    FOREACH mode IN ARRAY ARRAY['force_generic_plan', 'force_custom_plan']
+    LOOP
+        PERFORM set_config('plan_cache_mode', mode, true);
+        FOREACH statement IN ARRAY ARRAY[
+            'prepared_score', 'prepared_subquery_score', 'prepared_cte_score'
+        ]
+        LOOP
+            EXECUTE format(
+                'EXPLAIN (FORMAT JSON, COSTS OFF, VERBOSE) EXECUTE %I(%L)',
+                statement, 'hello') INTO plan;
+            IF plan::text NOT LIKE '%bm25_get_current_score()%' THEN
+                RAISE EXCEPTION '% (%) did not reuse the index score: %',
+                    statement, mode, plan;
+            END IF;
+        END LOOP;
+    END LOOP;
+END $$;
+DEALLOCATE prepared_score;
+DEALLOCATE prepared_subquery_score;
+DEALLOCATE prepared_cte_score;
+
+-- Nested scoring must not force its explicit index onto the outer scan.
+CREATE TABLE planner_scope_docs (id int PRIMARY KEY, content text);
+INSERT INTO planner_scope_docs VALUES
+    (1, 'running'), (2, 'runs'), (3, 'run');
+CREATE INDEX planner_scope_simple ON planner_scope_docs USING bm25(content)
+    WITH (text_config = 'simple') WHERE id = 1;
+CREATE INDEX planner_scope_english ON planner_scope_docs USING bm25(content)
+    WITH (text_config = 'english');
+DO $$
+DECLARE
+    baseline_ids int[];
+    nested_ids int[];
+BEGIN
+    SELECT array_agg(id ORDER BY id) INTO baseline_ids FROM (
+        SELECT id FROM planner_scope_docs
+        ORDER BY content <@> 'running' LIMIT 3
+    ) AS ranked;
+    IF baseline_ids IS DISTINCT FROM ARRAY[1, 2, 3] THEN
+        RAISE EXCEPTION 'unexpected outer scan results: %', baseline_ids;
+    END IF;
+    SELECT array_agg(id ORDER BY id) INTO nested_ids FROM (
+        SELECT id FROM planner_scope_docs
+        WHERE (
+            SELECT content <@>
+                to_bm25query('running', 'planner_scope_simple')
+            FROM planner_scope_docs WHERE id = 1
+        ) IS NOT NULL
+        ORDER BY content <@> 'running' LIMIT 3
+    ) AS ranked;
+    IF nested_ids IS DISTINCT FROM baseline_ids THEN
+        RAISE EXCEPTION 'nested index changed outer results: % vs %',
+            nested_ids, baseline_ids;
     END IF;
 END $$;
-DEALLOCATE prepared_subquery_score;
-RESET plan_cache_mode;
+DROP TABLE planner_scope_docs;
 
 -- Test 11: Implicit text <@> text in DELETE subquery (issue #213)
 -- The implicit form should work inside subqueries of DML statements
